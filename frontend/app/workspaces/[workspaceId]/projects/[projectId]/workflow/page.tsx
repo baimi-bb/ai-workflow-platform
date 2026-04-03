@@ -27,6 +27,12 @@ type FileEntry = {
   source?: string;
 };
 
+type ActivityEntry = {
+  timestamp: string;
+  stage: string;
+  message: string;
+};
+
 function buildTaskLevels(
   tasks: { id: number; task_dependencies: number[] }[],
 ): Map<number, number> {
@@ -81,6 +87,30 @@ function getFileEntries(
       return null;
     })
     .filter((entry): entry is FileEntry => entry !== null);
+}
+
+function getActivityEntries(payload: Record<string, unknown> | null): ActivityEntry[] {
+  const entries = payload?.activity_log;
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+
+  return entries
+    .map((entry) => {
+      if (typeof entry !== "object" || entry === null) {
+        return null;
+      }
+
+      const timestamp = "timestamp" in entry ? String(entry.timestamp) : "";
+      const stage = "stage" in entry ? String(entry.stage) : "";
+      const message = "message" in entry ? String(entry.message) : "";
+      if (!timestamp || !message) {
+        return null;
+      }
+
+      return { timestamp, stage, message };
+    })
+    .filter((entry): entry is ActivityEntry => entry !== null);
 }
 
 export default async function ProjectWorkflowPage({
@@ -299,6 +329,23 @@ export default async function ProjectWorkflowPage({
               {selectedRun.task_runs.map((taskRun) => {
                 const inputFiles = getFileEntries(taskRun.input_payload, "files");
                 const outputFiles = getFileEntries(taskRun.output_payload, "artifacts");
+                const activityEntries = [
+                  ...getActivityEntries(taskRun.input_payload),
+                  ...getActivityEntries(taskRun.output_payload),
+                ];
+                const dedupedActivityEntries = activityEntries.filter(
+                  (entry, index, list) =>
+                    list.findIndex(
+                      (candidate) =>
+                        candidate.timestamp === entry.timestamp &&
+                        candidate.stage === entry.stage &&
+                        candidate.message === entry.message,
+                    ) === index,
+                );
+                const latestActivity =
+                  dedupedActivityEntries.length > 0
+                    ? dedupedActivityEntries[dedupedActivityEntries.length - 1]
+                    : null;
 
                 return (
                   <article
@@ -328,6 +375,11 @@ export default async function ProjectWorkflowPage({
                           <span className="rounded-full bg-white px-3 py-1">
                             Attempts: {taskRun.attempt_count}
                           </span>
+                          {latestActivity ? (
+                            <span className="rounded-full bg-sky-50 px-3 py-1 text-sky-700">
+                              Activity: {latestActivity.message}
+                            </span>
+                          ) : null}
                         </div>
                         {taskRun.error_message ? (
                           <p className="rounded-2xl bg-rose-100 px-4 py-3 text-sm text-rose-700">
@@ -381,6 +433,31 @@ export default async function ProjectWorkflowPage({
                                     >
                                       {artifact.path}
                                     </p>
+                                  ))}
+                                </div>
+                              </div>
+                            ) : null}
+                            {dedupedActivityEntries.length > 0 ? (
+                              <div className="mt-3 border-t border-slate-200 pt-3">
+                                <p className="mb-2 text-xs uppercase tracking-[0.18em] text-slate-400">
+                                  Activity
+                                </p>
+                                <div className="grid gap-2">
+                                  {dedupedActivityEntries.map((entry, index) => (
+                                    <div
+                                      key={`${taskRun.id}-activity-${index}`}
+                                      className="rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600"
+                                    >
+                                      <div className="flex flex-wrap items-center gap-2">
+                                        <span className="rounded-full bg-white px-2 py-1 text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                                          {entry.stage}
+                                        </span>
+                                        <span className="text-[11px] text-slate-400">
+                                          {entry.timestamp}
+                                        </span>
+                                      </div>
+                                      <p className="mt-2 leading-6">{entry.message}</p>
+                                    </div>
                                   ))}
                                 </div>
                               </div>

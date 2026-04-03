@@ -1,4 +1,5 @@
 from collections import deque
+from pathlib import Path
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -17,11 +18,13 @@ START_X = 40
 START_Y = 120
 NODE_WIDTH = 340
 NODE_HEIGHT = 300
-HORIZONTAL_GAP = 180
-VERTICAL_GAP = 72
+HORIZONTAL_GAP = 260
+VERTICAL_GAP = 90
 LAYOUT_BASE_X = START_X + NODE_WIDTH + 120
 LAYOUT_BASE_Y = 120
 ROW_STEP = NODE_HEIGHT + VERTICAL_GAP
+ROW_LANE_MULTIPLIER = 1
+WORKSPACE_FILE_CONTEXT_LIMIT = 40
 
 
 def _load_planner_agent_or_400(db: Session, workspace_id: int, planner_agent_id: int) -> Agent:
@@ -71,6 +74,22 @@ def _normalize_task_description(value: object) -> str | None:
         )
     normalized = value.strip()
     return normalized or None
+
+
+def _normalize_optional_text(value: object, *, field_name: str, max_length: int = 400) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400, detail=f"Planner {field_name} must be a string")
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if len(normalized) > max_length:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Planner {field_name} is too long: {normalized[:40]}...",
+        )
+    return normalized
 
 
 def _normalize_task_priority(value: object) -> str:
@@ -133,6 +152,116 @@ def _normalize_depends_on_titles(raw_task: dict, known_titles: set[str]) -> list
     return normalized_dependencies
 
 
+def _normalize_workspace_paths(raw_task: dict) -> list[str]:
+    raw_paths = raw_task.get("required_workspace_paths")
+    return _normalize_path_list(raw_paths, field_name="required_workspace_paths")
+
+
+def _normalize_output_paths(raw_task: dict) -> list[str]:
+    raw_paths = raw_task.get("suggested_output_paths")
+    return _normalize_path_list(raw_paths, field_name="suggested_output_paths")
+
+
+def _normalize_path_list(raw_paths: object, *, field_name: str) -> list[str]:
+    if raw_paths is None:
+        return []
+    if not isinstance(raw_paths, list):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Planner {field_name} must be an array",
+        )
+
+    normalized_paths: list[str] = []
+    seen: set[str] = set()
+    for item in raw_paths:
+        if not isinstance(item, str):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Planner {field_name} entries must be strings",
+            )
+        normalized = item.strip().replace("\\", "/").strip("/")
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        normalized_paths.append(normalized)
+    return normalized_paths
+
+
+def _merge_title_dependencies(*dependency_groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in dependency_groups:
+        for title in group:
+            if title in seen:
+                continue
+            seen.add(title)
+            merged.append(title)
+    return merged
+
+
+def _build_standard_task_description(planned_task: dict[str, object]) -> str:
+    lines: list[str] = []
+    summary = planned_task.get("description")
+    objective = planned_task.get("objective")
+    deliverable = planned_task.get("deliverable")
+    workspace_paths = planned_task.get("required_workspace_paths") or []
+    output_paths = planned_task.get("suggested_output_paths") or []
+    input_task_titles = planned_task.get("input_from_titles") or []
+
+    if isinstance(summary, str) and summary.strip():
+        lines.append(summary.strip())
+        lines.append("")
+
+    lines.append("Execution Standard:")
+    if isinstance(objective, str) and objective.strip():
+        lines.append(f"- Objective: {objective.strip()}")
+    if isinstance(deliverable, str) and deliverable.strip():
+        lines.append(f"- Deliverable: {deliverable.strip()}")
+    if isinstance(workspace_paths, list) and workspace_paths:
+        lines.append(f"- Required workspace files: {', '.join(workspace_paths)}")
+    if isinstance(output_paths, list) and output_paths:
+        lines.append(f"- Suggested output files: {', '.join(output_paths)}")
+    if isinstance(input_task_titles, list) and input_task_titles:
+        lines.append(f"- Required upstream task outputs: {', '.join(input_task_titles)}")
+    lines.append("- Complete the work directly. Do not stop at a plan or explanation.")
+    lines.append("- If the task needs files or datasets, write the actual output files.")
+    return "\n".join(lines).strip()
+
+
+def _collect_workspace_file_context(root_path: str | None) -> list[str]:
+    if not isinstance(root_path, str) or not root_path.strip():
+        return []
+
+    try:
+        normalized_root = Path(root_path).expanduser().resolve()
+    except OSError:
+        return []
+
+    if not normalized_root.exists() or not normalized_root.is_dir():
+        return []
+
+    collected: list[str] = []
+    try:
+        for entry in sorted(normalized_root.rglob("*")):
+            if len(collected) >= WORKSPACE_FILE_CONTEXT_LIMIT:
+                break
+            if not entry.is_file():
+                continue
+            try:
+                relative_path = entry.relative_to(normalized_root).as_posix()
+            except ValueError:
+                continue
+            if any(part.startswith(".") for part in entry.parts):
+                continue
+            collected.append(relative_path)
+    except OSError:
+        return collected
+
+    return collected
+
+
 def _assert_acyclic(tasks: list[dict[str, object]]) -> None:
     indegree: dict[str, int] = {task["title"]: 0 for task in tasks}
     graph: dict[str, list[str]] = {task["title"]: [] for task in tasks}
@@ -185,13 +314,27 @@ def _parse_plan_payload(plan_payload: dict, enabled_agents: list[Agent]) -> tupl
             {
                 "title": title,
                 "description": _normalize_task_description(raw_task.get("description")),
+                "objective": _normalize_optional_text(raw_task.get("objective"), field_name="objective"),
+                "deliverable": _normalize_optional_text(raw_task.get("deliverable"), field_name="deliverable"),
                 "priority": _normalize_task_priority(raw_task.get("priority")),
                 "assigned_agent_id": _resolve_assignment(raw_task, enabled_agents),
+                "required_workspace_paths": _normalize_workspace_paths(raw_task),
+                "suggested_output_paths": _normalize_output_paths(raw_task),
             }
         )
 
     for normalized_task, raw_task in zip(normalized_tasks, raw_tasks, strict=False):
-        normalized_task["depends_on_titles"] = _normalize_depends_on_titles(raw_task, seen_titles)
+        blocking_titles = _normalize_depends_on_titles(raw_task, seen_titles)
+        input_from_titles = _normalize_depends_on_titles(
+            {"depends_on_titles": raw_task.get("input_from_titles")},
+            seen_titles,
+        )
+        normalized_task["input_from_titles"] = input_from_titles
+        normalized_task["depends_on_titles"] = _merge_title_dependencies(
+            blocking_titles,
+            input_from_titles,
+        )
+        normalized_task["description"] = _build_standard_task_description(normalized_task)
         if normalized_task["title"] in normalized_task["depends_on_titles"]:
             raise HTTPException(
                 status_code=400,
@@ -215,23 +358,43 @@ def _build_project_plan_prompt(project, payload: ProjectPlanCreate, enabled_agen
         )
         for agent in enabled_agents
     ]
+    workspace_file_lines = _collect_workspace_file_context(project.workspace.root_path)
     return "\n".join(
         [
-            "You are planning tasks for an AI workflow project.",
+            "You are planning tasks for an AI workflow project inside a real workspace environment.",
             "Generate a practical execution plan as strict JSON only.",
             "Do not include markdown fences.",
             "Do not modify existing tasks; append a new plan that can coexist with them.",
             "Return JSON with this shape exactly:",
-            '{"summary":"short summary","tasks":[{"title":"Task title","description":"what this task should do","priority":"high|medium|low","assigned_agent_id":123,"depends_on_titles":["Another task"]}]}',
+            (
+                '{"summary":"short summary","tasks":[{"title":"Task title","description":"short task summary",'
+                '"objective":"clear execution goal","deliverable":"specific expected output",'
+                '"priority":"high|medium|low","assigned_agent_id":123,'
+                '"depends_on_titles":["blocking task"],'
+                '"input_from_titles":["task whose outputs or information are needed"],'
+                '"required_workspace_paths":["relative/path/to/file.ext"],'
+                '"suggested_output_paths":["relative/path/to/output.ext"]}]}'
+            ),
             "Use only agent ids that appear below. Use null or omit assigned_agent_id if no suitable agent exists.",
             "Keep task titles unique within this generated plan.",
             "Create only normal work tasks. Do not create start or end nodes.",
+            "Design tasks that fit the actual workspace and available files, not a generic template.",
+            "Prefer concrete, execution-ready tasks over vague planning tasks.",
+            "Use multiple dependencies whenever a task truly needs multiple upstream outputs.",
+            "If a task needs information or files from another task, include that task in input_from_titles.",
+            "If a task needs an existing workspace file, include it in required_workspace_paths.",
+            "If a task should create files, include suggested_output_paths with concrete workspace-relative target paths.",
+            "Make dependencies accurate. Do not force a single-chain workflow when parallel work is possible.",
             "",
             f"Project name: {project.name}",
             f"Project description: {project.description or 'None'}",
+            f"Workspace root path: {project.workspace.root_path or 'not configured'}",
             "",
             "Available enabled agents:",
             "\n".join(agent_lines) if agent_lines else "- none",
+            "",
+            "Workspace files you can plan around:",
+            "\n".join(f"- {path}" for path in workspace_file_lines) if workspace_file_lines else "- none",
             "",
             "Existing project tasks:",
             "\n".join(existing_task_lines) if existing_task_lines else "- none",
@@ -288,6 +451,10 @@ def _average(values: list[float]) -> float:
     if not values:
         return 0.0
     return sum(values) / len(values)
+
+
+def _snap_to_lane(value: float) -> int:
+    return max(0, int((value / ROW_LANE_MULTIPLIER) + 0.5) * ROW_LANE_MULTIPLIER)
 
 
 def _sync_project_workflow_defaults(db: Session, workspace_id: int, project_id: int) -> None:
@@ -400,11 +567,33 @@ def _build_layout_row_map(
             sortable_tasks.append((anchor, task.display_order, task))
 
         sortable_tasks.sort(key=lambda item: (item[0], item[1], item[2].id))
+
+        if len(sortable_tasks) == 1:
+            _anchor, _display_order, task = sortable_tasks[0]
+            dependency_rows = [
+                row_map[dependency_id]
+                for dependency_id in (task.task_dependencies or [])
+                if dependency_id in row_map
+            ]
+            if len(dependency_rows) == 1:
+                parent_row = dependency_rows[0]
+                zigzag_offset = (
+                    ROW_LANE_MULTIPLIER if depth % 2 == 0 else -ROW_LANE_MULTIPLIER
+                )
+                row_map[task.id] = max(0, parent_row + zigzag_offset)
+            elif dependency_rows:
+                row_map[task.id] = _snap_to_lane(
+                    _average([float(row) for row in dependency_rows])
+                )
+            else:
+                row_map[task.id] = 0
+            continue
+
         anchor_mean = _average([item[0] for item in sortable_tasks])
         start_row = max(0, round(anchor_mean - (len(sortable_tasks) - 1) / 2))
 
         for index, (_anchor, _display_order, task) in enumerate(sortable_tasks):
-            row_map[task.id] = start_row + index
+            row_map[task.id] = (start_row + index) * ROW_LANE_MULTIPLIER
 
     return row_map
 

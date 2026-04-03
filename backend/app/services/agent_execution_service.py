@@ -3,6 +3,7 @@ import re
 from datetime import UTC, datetime
 from html import unescape
 from pathlib import Path
+from typing import Callable
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -172,6 +173,178 @@ def _strip_html_to_text(html: str) -> str:
     return re.sub(r"\s+", " ", normalized).strip()
 
 
+def _native_tool_platform_supported(platform: str) -> bool:
+    return platform in {"openai", "deepseek", "openrouter", "custom", "anthropic", "google"}
+
+
+def _agent_prefers_native_tools(agent: Agent) -> bool:
+    provider_model = agent.provider_model
+    provider = provider_model.provider if provider_model is not None else None
+    if provider_model is None or provider is None:
+        return False
+    return provider_model.supports_tools and _native_tool_platform_supported(provider.platform)
+
+
+def _build_openai_tool_definitions() -> list[dict[str, object]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web for current public information.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query keywords."},
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum number of search results to return.",
+                        },
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "fetch_url",
+                "description": "Fetch the text content of an HTTP or HTTPS URL.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "The absolute URL to fetch."},
+                        "max_chars": {
+                            "type": "integer",
+                            "description": "Maximum number of characters to return.",
+                        },
+                    },
+                    "required": ["url"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    ]
+
+
+def _build_anthropic_tool_definitions() -> list[dict[str, object]]:
+    return [
+        {
+            "name": "web_search",
+            "description": "Search the web for current public information.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer"},
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "fetch_url",
+            "description": "Fetch the text content of an HTTP or HTTPS URL.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "max_chars": {"type": "integer"},
+                },
+                "required": ["url"],
+            },
+        },
+    ]
+
+
+def _build_google_tool_definitions() -> list[dict[str, object]]:
+    return [
+        {
+            "functionDeclarations": [
+                {
+                    "name": "web_search",
+                    "description": "Search the web for current public information.",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "query": {"type": "STRING"},
+                            "max_results": {"type": "INTEGER"},
+                        },
+                        "required": ["query"],
+                    },
+                },
+                {
+                    "name": "fetch_url",
+                    "description": "Fetch the text content of an HTTP or HTTPS URL.",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "url": {"type": "STRING"},
+                            "max_chars": {"type": "INTEGER"},
+                        },
+                        "required": ["url"],
+                    },
+                },
+            ]
+        }
+    ]
+
+
+def _normalize_tool_arguments(arguments: object) -> dict[str, object]:
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid tool arguments JSON: {exc}") from exc
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("Tool arguments must be a JSON object")
+
+
+def _normalize_provider_tool_call(
+    *,
+    tool_name: str,
+    arguments: object,
+    call_id: str | None = None,
+) -> dict[str, object]:
+    normalized_name = tool_name.strip()
+    if not normalized_name:
+        raise ValueError("Tool name cannot be empty")
+
+    normalized_arguments = _normalize_tool_arguments(arguments)
+    normalized_call: dict[str, object] = {"tool": normalized_name}
+    if call_id:
+        normalized_call["_tool_call_id"] = call_id
+
+    if normalized_name == "web_search":
+        query = normalized_arguments.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("web_search requires a query string")
+        normalized_call["query"] = query.strip()
+        max_results = normalized_arguments.get("max_results")
+        if isinstance(max_results, int):
+            normalized_call["max_results"] = max_results
+        return normalized_call
+
+    if normalized_name == "fetch_url":
+        url = normalized_arguments.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError("fetch_url requires a url string")
+        normalized_call["url"] = url.strip()
+        max_chars = normalized_arguments.get("max_chars")
+        if isinstance(max_chars, int):
+            normalized_call["max_chars"] = max_chars
+        return normalized_call
+
+    raise ValueError(f"Unsupported tool call: {normalized_name}")
+
+
+def _stringify_tool_result_for_provider(result: dict[str, object]) -> str:
+    return json.dumps(result, ensure_ascii=False)
+
+
 def _extract_tool_calls_from_text(response_text: str) -> list[dict[str, object]]:
     payload = _extract_json_object_from_text(response_text)
     if payload is None:
@@ -213,10 +386,10 @@ def _validate_final_response_payload(response_text: str) -> dict | None:
         )
 
     files_payload = payload.get("files")
-    if not isinstance(files_payload, list):
+    if files_payload is not None and not isinstance(files_payload, list):
         raise HTTPException(
             status_code=502,
-            detail="Agent final response must include a files array",
+            detail="Agent final response files field must be an array when provided",
         )
 
     summary = payload.get("summary")
@@ -229,48 +402,12 @@ def _validate_final_response_payload(response_text: str) -> dict | None:
     return payload
 
 
-def _task_requires_artifact_output(task_run: TaskRun) -> bool:
-    task = task_run.task
-    text = "\n".join(
-        part for part in [task.title, task.description or ""] if isinstance(part, str) and part
-    ).casefold()
-    keywords = [
-        "collect",
-        "gather",
-        "export",
-        "generate file",
-        "dataset",
-        "csv",
-        "excel",
-        "json",
-        "markdown",
-        "报告数据",
-        "收集",
-        "整理",
-        "校验",
-        "导出",
-        "原始数据",
-        "数据源",
-        "台账",
-        "报表",
-        "文件",
-        ".csv",
-        ".xlsx",
-        ".json",
-        ".md",
-    ]
-    return any(keyword in text for keyword in keywords)
-
-
 def _detect_incomplete_task_result(
     task_run: TaskRun,
     text: str,
     artifacts: list[dict[str, str]],
 ) -> str | None:
     normalized_text = text.strip().casefold()
-    if _task_requires_artifact_output(task_run) and not artifacts:
-        return "Task expected file or dataset output, but the agent produced no artifacts"
-
     deferral_markers = [
         "需要先",
         "请提供",
@@ -308,6 +445,28 @@ def _resolve_workspace_file_path(root_path: str, relative_path: str) -> Path:
             detail="Requested file path must stay within the workspace root path",
         ) from exc
     return target_path
+
+
+def _append_activity_event(
+    task_run: TaskRun,
+    *,
+    stage: str,
+    message: str,
+    details: dict[str, object] | None = None,
+) -> None:
+    payload = task_run.input_payload if isinstance(task_run.input_payload, dict) else {}
+    existing_log = payload.get("activity_log")
+    activity_log = existing_log if isinstance(existing_log, list) else []
+    activity_log.append(
+        {
+            "timestamp": _utcnow().isoformat(),
+            "stage": stage,
+            "message": message,
+            "details": details or {},
+        }
+    )
+    payload["activity_log"] = activity_log[-50:]
+    task_run.input_payload = payload
 
 
 def _fetch_text_url(url: str, timeout: int = 20, *, strip_html: bool = True) -> str:
@@ -503,6 +662,163 @@ def _execute_agent_roundtrip(agent: Agent, initial_prompt: str) -> tuple[str, di
                         "error": f"Web request failed: {exc.reason}",
                     }
                 )
+
+        tool_results.extend(executed_results)
+        prompt = "\n\n".join(
+            [
+                initial_prompt,
+                "Previous assistant response:",
+                raw_text,
+                "Tool results:",
+                json.dumps(executed_results, ensure_ascii=False),
+                (
+                    "Continue the task using the tool results. "
+                    "Return strict JSON only. If you still need tools, include tool_calls again. "
+                    "Otherwise return the final summary/files payload."
+                ),
+            ]
+        )
+
+    raise HTTPException(
+        status_code=502,
+        detail="Agent exceeded the maximum number of web tool iterations",
+    )
+
+
+def _execute_agent_roundtrip_with_activity(
+    db: Session,
+    task_run: TaskRun,
+    agent: Agent,
+    initial_prompt: str,
+) -> tuple[str, dict, list[dict[str, object]]]:
+    if _agent_prefers_native_tools(agent):
+        def activity_callback(stage: str, message: str, details: dict[str, object]) -> None:
+            _append_activity_event(
+                task_run,
+                stage=stage,
+                message=message,
+                details=details,
+            )
+            db.commit()
+
+        return _execute_agent_roundtrip_native_tools(
+            agent,
+            initial_prompt,
+            activity_callback=activity_callback,
+        )
+
+    prompt = initial_prompt
+    raw_payload: dict = {}
+    tool_results: list[dict[str, object]] = []
+
+    for iteration_index in range(settings.agent_web_max_iterations):
+        _append_activity_event(
+            task_run,
+            stage="model_request",
+            message=f"Calling model for iteration {iteration_index + 1}",
+            details={"iteration": iteration_index + 1},
+        )
+        db.commit()
+        raw_text, raw_payload = _call_provider(agent, prompt)
+        tool_calls = _extract_tool_calls_from_text(raw_text)
+        if not tool_calls:
+            final_payload = _extract_json_object_from_text(raw_text)
+            _append_activity_event(
+                task_run,
+                stage="model_response",
+                message="Model returned a final response",
+                details={
+                    "iteration": iteration_index + 1,
+                    "has_json_payload": final_payload is not None,
+                },
+            )
+            db.commit()
+            if final_payload is not None:
+                return (
+                    json.dumps(final_payload, ensure_ascii=False),
+                    raw_payload,
+                    tool_results,
+                )
+            return raw_text, raw_payload, tool_results
+
+        _append_activity_event(
+            task_run,
+            stage="tool_request",
+            message=f"Model requested {len(tool_calls)} tool call(s)",
+            details={
+                "iteration": iteration_index + 1,
+                "tools": [str(tool_call.get('tool', '')) for tool_call in tool_calls],
+            },
+        )
+        db.commit()
+
+        executed_results: list[dict[str, object]] = []
+        for tool_call in tool_calls:
+            tool_name = str(tool_call.get("tool", "")).strip()
+            _append_activity_event(
+                task_run,
+                stage="tool_execute",
+                message=f"Executing tool: {tool_name}",
+                details={"tool_request": tool_call},
+            )
+            db.commit()
+            try:
+                result = _execute_tool_call(tool_call)
+                executed_results.append({"ok": True, "request": tool_call, "result": result})
+                _append_activity_event(
+                    task_run,
+                    stage="tool_result",
+                    message=f"Tool {tool_name} completed",
+                    details={"tool_result": result},
+                )
+                db.commit()
+            except HTTPException as exc:
+                executed_results.append(
+                    {
+                        "ok": False,
+                        "request": tool_call,
+                        "error": str(exc.detail),
+                    }
+                )
+                _append_activity_event(
+                    task_run,
+                    stage="tool_result",
+                    message=f"Tool {tool_name} failed",
+                    details={"error": str(exc.detail)},
+                )
+                db.commit()
+            except urllib_error.HTTPError as exc:
+                error_message = _extract_http_error_message(exc)
+                executed_results.append(
+                    {
+                        "ok": False,
+                        "request": tool_call,
+                        "error": error_message,
+                    }
+                )
+                _append_activity_event(
+                    task_run,
+                    stage="tool_result",
+                    message=f"Tool {tool_name} failed",
+                    details={"error": error_message},
+                )
+                db.commit()
+            except urllib_error.URLError as exc:
+                error_message = f"Web request failed: {exc.reason}"
+                executed_results.append(
+                    {
+                        "ok": False,
+                        "request": tool_call,
+                        "error": error_message,
+                    }
+                )
+                _append_activity_event(
+                    task_run,
+                    stage="tool_result",
+                    message=f"Tool {tool_name} failed",
+                    details={"error": error_message},
+                )
+                db.commit()
 
         tool_results.extend(executed_results)
         prompt = "\n\n".join(
@@ -866,6 +1182,189 @@ def _execute_google(
     return text, raw_payload
 
 
+def _execute_openai_compatible_with_native_tools(
+    *,
+    provider: Provider,
+    provider_model: ProviderModel,
+    system_prompt: str | None,
+    messages: list[dict[str, object]],
+) -> tuple[str, dict, list[dict[str, object]], dict[str, object]]:
+    base_url = (provider.base_url or "").strip().rstrip("/") or "https://api.openai.com/v1"
+    request_url = f"{base_url}/chat/completions"
+    payload: dict[str, object] = {
+        "model": provider_model.model_name,
+        "messages": messages,
+        "tools": _build_openai_tool_definitions(),
+        "tool_choice": "auto",
+    }
+    if provider_model.temperature is not None:
+        payload["temperature"] = provider_model.temperature
+    if provider_model.max_output_tokens is not None:
+        payload[_get_openai_max_tokens_field(provider_model.model_name)] = (
+            provider_model.max_output_tokens
+        )
+    if system_prompt:
+        payload["messages"] = [
+            {"role": "system", "content": system_prompt},
+            *messages,
+        ]
+
+    request = urllib_request.Request(
+        request_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {provider.api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib_request.urlopen(request, timeout=60) as response:
+        raw_payload = json.loads(response.read().decode("utf-8"))
+
+    message = ((raw_payload.get("choices") or [{}])[0]).get("message", {})
+    text = _stringify_response_text(message.get("content", ""))
+    raw_tool_calls = message.get("tool_calls")
+    tool_calls: list[dict[str, object]] = []
+    if isinstance(raw_tool_calls, list):
+        for item in raw_tool_calls:
+            if not isinstance(item, dict):
+                continue
+            function_payload = item.get("function")
+            if not isinstance(function_payload, dict):
+                continue
+            tool_name = function_payload.get("name")
+            if not isinstance(tool_name, str):
+                continue
+            tool_calls.append(
+                _normalize_provider_tool_call(
+                    tool_name=tool_name,
+                    arguments=function_payload.get("arguments", {}),
+                    call_id=str(item.get("id", "")).strip() or None,
+                )
+            )
+    return text, raw_payload, tool_calls, message
+
+
+def _execute_anthropic_with_native_tools(
+    *,
+    provider: Provider,
+    provider_model: ProviderModel,
+    system_prompt: str | None,
+    messages: list[dict[str, object]],
+) -> tuple[str, dict, list[dict[str, object]], list[dict[str, object]]]:
+    base_url = (provider.base_url or "").strip().rstrip("/") or "https://api.anthropic.com"
+    request_url = f"{base_url}/v1/messages"
+    payload: dict[str, object] = {
+        "model": provider_model.model_name,
+        "max_tokens": provider_model.max_output_tokens or 1024,
+        "messages": messages,
+        "tools": _build_anthropic_tool_definitions(),
+    }
+    if system_prompt:
+        payload["system"] = system_prompt
+    if provider_model.temperature is not None:
+        payload["temperature"] = provider_model.temperature
+
+    request = urllib_request.Request(
+        request_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "x-api-key": provider.api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib_request.urlopen(request, timeout=60) as response:
+        raw_payload = json.loads(response.read().decode("utf-8"))
+
+    content_blocks = raw_payload.get("content") or []
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, object]] = []
+    if isinstance(content_blocks, list):
+        for block in content_blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text" and isinstance(block.get("text"), str):
+                text_parts.append(block["text"])
+                continue
+            if block_type != "tool_use":
+                continue
+            tool_name = block.get("name")
+            if not isinstance(tool_name, str):
+                continue
+            tool_calls.append(
+                _normalize_provider_tool_call(
+                    tool_name=tool_name,
+                    arguments=block.get("input", {}),
+                    call_id=str(block.get("id", "")).strip() or None,
+                )
+            )
+    return "\n".join(part for part in text_parts if part).strip(), raw_payload, tool_calls, content_blocks
+
+
+def _execute_google_with_native_tools(
+    *,
+    provider: Provider,
+    provider_model: ProviderModel,
+    system_prompt: str | None,
+    contents: list[dict[str, object]],
+) -> tuple[str, dict, list[dict[str, object]], list[dict[str, object]]]:
+    base_url = (
+        (provider.base_url or "").strip().rstrip("/")
+        or "https://generativelanguage.googleapis.com"
+    )
+    model_name = provider_model.model_name
+    query_string = urllib_parse.urlencode({"key": provider.api_key})
+    request_url = f"{base_url}/v1beta/models/{model_name}:generateContent?{query_string}"
+    payload: dict[str, object] = {
+        "contents": contents,
+        "tools": _build_google_tool_definitions(),
+    }
+    if system_prompt:
+        payload["systemInstruction"] = {
+            "parts": [{"text": system_prompt}],
+        }
+
+    request = urllib_request.Request(
+        request_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib_request.urlopen(request, timeout=60) as response:
+        raw_payload = json.loads(response.read().decode("utf-8"))
+
+    candidates = raw_payload.get("candidates") or []
+    parts_payload: list[dict[str, object]] = []
+    if candidates:
+        parts_payload = ((candidates[0].get("content") or {}).get("parts")) or []
+
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, object]] = []
+    for part in parts_payload:
+        if not isinstance(part, dict):
+            continue
+        text_value = part.get("text")
+        if isinstance(text_value, str) and text_value.strip():
+            text_parts.append(text_value)
+        function_call = part.get("functionCall")
+        if not isinstance(function_call, dict):
+            continue
+        tool_name = function_call.get("name")
+        if not isinstance(tool_name, str):
+            continue
+        tool_calls.append(
+            _normalize_provider_tool_call(
+                tool_name=tool_name,
+                arguments=function_call.get("args", {}),
+                call_id=str(function_call.get("id", "")).strip() or None,
+            )
+        )
+    return "\n".join(text_parts).strip(), raw_payload, tool_calls, parts_payload
+
+
 def _build_user_prompt(task_run: TaskRun) -> tuple[str, list[dict[str, str]]]:
     task = task_run.task
     workflow_run = task_run.workflow_run
@@ -873,29 +1372,44 @@ def _build_user_prompt(task_run: TaskRun) -> tuple[str, list[dict[str, str]]]:
     workspace = project.workspace
     input_file_context, input_files = _load_input_file_context(task_run)
 
-    prompt = "\n".join(
+    prompt_parts = [
+        f"Workspace: {workspace.name}",
+        f"Workspace root path: {workspace.root_path or 'not configured'}",
+        f"Project: {project.name}",
+        f"Task title: {task.title}",
+        f"Task description: {task.description or 'No description provided.'}",
+        f"Task priority: {task.priority}",
+        f"Task dependencies: {', '.join(map(str, task_run.task_dependencies_snapshot or [])) or 'None'}",
+        input_file_context,
+    ]
+    if task_run.assigned_agent is not None and _agent_prefers_native_tools(task_run.assigned_agent):
+        prompt_parts.extend(
+            [
+                "If the task needs current online information, call the provided web tools directly.",
+                "Do not describe tool calls in plain text and do not pretend that a tool has already run.",
+            ]
+        )
+    else:
+        prompt_parts.extend(
+            [
+                "You may use controlled web tools if the task needs current online information.",
+                (
+                    'Tool request JSON format: {"summary":"short note","files":[],'
+                    '"tool_calls":[{"tool":"web_search","query":"topic","max_results":5},'
+                    '{"tool":"fetch_url","url":"https://example.com","max_chars":6000}]}'
+                ),
+                "Use tool_calls only when necessary. Keep them minimal and specific.",
+            ]
+        )
+    prompt_parts.extend(
         [
-            f"Workspace: {workspace.name}",
-            f"Workspace root path: {workspace.root_path or 'not configured'}",
-            f"Project: {project.name}",
-            f"Task title: {task.title}",
-            f"Task description: {task.description or 'No description provided.'}",
-            f"Task priority: {task.priority}",
-            f"Task dependencies: {', '.join(map(str, task_run.task_dependencies_snapshot or [])) or 'None'}",
-            input_file_context,
-            "You may use controlled web tools if the task needs current online information.",
-            (
-                'Tool request JSON format: {"summary":"short note","files":[],'
-                '"tool_calls":[{"tool":"web_search","query":"topic","max_results":5},'
-                '{"tool":"fetch_url","url":"https://example.com","max_chars":6000}]}'
-            ),
-            "Use tool_calls only when necessary. Keep them minimal and specific.",
-            "If you need to create or edit files, respond with strict JSON only.",
-            'Final JSON format: {"summary":"short result","files":[{"path":"relative/path.txt","content":"file content"}]}',
+            "Respond with strict JSON only.",
+            'If you need to create or edit files, use: {"summary":"short result","files":[{"path":"relative/path.txt","content":"file content"}]}',
             "Only use paths relative to the workspace root path.",
-            "If no file changes are needed, respond with strict JSON: {\"summary\":\"short result\",\"files\":[]}",
+            'If no file changes are needed, you may respond with: {"summary":"short result"}',
         ]
     )
+    prompt = "\n".join(prompt_parts)
     return prompt, input_files
 
 
@@ -925,6 +1439,201 @@ def _call_provider(agent: Agent, user_prompt: str) -> tuple[str, dict]:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
         )
+    raise HTTPException(status_code=400, detail="Unsupported provider platform")
+
+
+def _run_tool_call_with_error_capture(tool_call: dict[str, object]) -> dict[str, object]:
+    try:
+        result = _execute_tool_call(tool_call)
+        return {"ok": True, "request": tool_call, "result": result}
+    except HTTPException as exc:
+        return {"ok": False, "request": tool_call, "error": str(exc.detail)}
+    except urllib_error.HTTPError as exc:
+        return {
+            "ok": False,
+            "request": tool_call,
+            "error": _extract_http_error_message(exc),
+        }
+    except urllib_error.URLError as exc:
+        return {
+            "ok": False,
+            "request": tool_call,
+            "error": f"Web request failed: {exc.reason}",
+        }
+
+
+def _execute_agent_roundtrip_native_tools(
+    agent: Agent,
+    initial_prompt: str,
+    activity_callback: Callable[[str, str, dict[str, object]], None] | None = None,
+) -> tuple[str, dict, list[dict[str, object]]]:
+    provider_model = agent.provider_model
+    provider = provider_model.provider
+    system_prompt = agent.system_prompt
+    raw_payload: dict = {}
+    tool_results: list[dict[str, object]] = []
+
+    def emit(stage: str, message: str, details: dict[str, object] | None = None) -> None:
+        if activity_callback is not None:
+            activity_callback(stage, message, details or {})
+
+    if provider.platform in {"openai", "deepseek", "openrouter", "custom"}:
+        messages: list[dict[str, object]] = [{"role": "user", "content": initial_prompt}]
+        for iteration_index in range(settings.agent_web_max_iterations):
+            emit("model_request", f"Calling model for iteration {iteration_index + 1}", {"iteration": iteration_index + 1})
+            raw_text, raw_payload, tool_calls, assistant_message = _execute_openai_compatible_with_native_tools(
+                provider=provider,
+                provider_model=provider_model,
+                system_prompt=system_prompt,
+                messages=messages,
+            )
+            if not tool_calls:
+                emit(
+                    "model_response",
+                    "Model returned a final response",
+                    {
+                        "iteration": iteration_index + 1,
+                        "has_json_payload": _extract_json_object_from_text(raw_text) is not None,
+                    },
+                )
+                return raw_text, raw_payload, tool_results
+
+            emit(
+                "tool_request",
+                f"Model requested {len(tool_calls)} tool call(s)",
+                {
+                    "iteration": iteration_index + 1,
+                    "tools": [str(tool_call.get("tool", "")) for tool_call in tool_calls],
+                },
+            )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_message.get("content", "") or "",
+                    "tool_calls": assistant_message.get("tool_calls", []),
+                }
+            )
+            for tool_call in tool_calls:
+                tool_name = str(tool_call.get("tool", "")).strip()
+                emit("tool_execute", f"Executing tool: {tool_name}", {"tool_request": tool_call})
+                executed_result = _run_tool_call_with_error_capture(tool_call)
+                tool_results.append(executed_result)
+                if executed_result.get("ok"):
+                    emit("tool_result", f"Tool {tool_name} completed", {"tool_result": executed_result.get("result")})
+                else:
+                    emit("tool_result", f"Tool {tool_name} failed", {"error": executed_result.get("error")})
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.get("_tool_call_id"),
+                        "content": _stringify_tool_result_for_provider(executed_result),
+                    }
+                )
+        raise HTTPException(status_code=502, detail="Agent exceeded the maximum number of web tool iterations")
+
+    if provider.platform == "anthropic":
+        messages = [{"role": "user", "content": initial_prompt}]
+        for iteration_index in range(settings.agent_web_max_iterations):
+            emit("model_request", f"Calling model for iteration {iteration_index + 1}", {"iteration": iteration_index + 1})
+            raw_text, raw_payload, tool_calls, content_blocks = _execute_anthropic_with_native_tools(
+                provider=provider,
+                provider_model=provider_model,
+                system_prompt=system_prompt,
+                messages=messages,
+            )
+            if not tool_calls:
+                emit(
+                    "model_response",
+                    "Model returned a final response",
+                    {
+                        "iteration": iteration_index + 1,
+                        "has_json_payload": _extract_json_object_from_text(raw_text) is not None,
+                    },
+                )
+                return raw_text, raw_payload, tool_results
+
+            emit(
+                "tool_request",
+                f"Model requested {len(tool_calls)} tool call(s)",
+                {
+                    "iteration": iteration_index + 1,
+                    "tools": [str(tool_call.get("tool", "")) for tool_call in tool_calls],
+                },
+            )
+            messages.append({"role": "assistant", "content": content_blocks})
+            tool_result_blocks: list[dict[str, object]] = []
+            for tool_call in tool_calls:
+                tool_name = str(tool_call.get("tool", "")).strip()
+                emit("tool_execute", f"Executing tool: {tool_name}", {"tool_request": tool_call})
+                executed_result = _run_tool_call_with_error_capture(tool_call)
+                tool_results.append(executed_result)
+                if executed_result.get("ok"):
+                    emit("tool_result", f"Tool {tool_name} completed", {"tool_result": executed_result.get("result")})
+                else:
+                    emit("tool_result", f"Tool {tool_name} failed", {"error": executed_result.get("error")})
+                tool_result_blocks.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.get("_tool_call_id"),
+                        "content": _stringify_tool_result_for_provider(executed_result),
+                    }
+                )
+            messages.append({"role": "user", "content": tool_result_blocks})
+        raise HTTPException(status_code=502, detail="Agent exceeded the maximum number of web tool iterations")
+
+    if provider.platform == "google":
+        contents: list[dict[str, object]] = [
+            {"role": "user", "parts": [{"text": initial_prompt}]}
+        ]
+        for iteration_index in range(settings.agent_web_max_iterations):
+            emit("model_request", f"Calling model for iteration {iteration_index + 1}", {"iteration": iteration_index + 1})
+            raw_text, raw_payload, tool_calls, parts_payload = _execute_google_with_native_tools(
+                provider=provider,
+                provider_model=provider_model,
+                system_prompt=system_prompt,
+                contents=contents,
+            )
+            if not tool_calls:
+                emit(
+                    "model_response",
+                    "Model returned a final response",
+                    {
+                        "iteration": iteration_index + 1,
+                        "has_json_payload": _extract_json_object_from_text(raw_text) is not None,
+                    },
+                )
+                return raw_text, raw_payload, tool_results
+
+            emit(
+                "tool_request",
+                f"Model requested {len(tool_calls)} tool call(s)",
+                {
+                    "iteration": iteration_index + 1,
+                    "tools": [str(tool_call.get("tool", "")) for tool_call in tool_calls],
+                },
+            )
+            contents.append({"role": "model", "parts": parts_payload})
+            response_parts: list[dict[str, object]] = []
+            for tool_call in tool_calls:
+                tool_name = str(tool_call.get("tool", "")).strip()
+                emit("tool_execute", f"Executing tool: {tool_name}", {"tool_request": tool_call})
+                executed_result = _run_tool_call_with_error_capture(tool_call)
+                tool_results.append(executed_result)
+                if executed_result.get("ok"):
+                    emit("tool_result", f"Tool {tool_name} completed", {"tool_result": executed_result.get("result")})
+                else:
+                    emit("tool_result", f"Tool {tool_name} failed", {"error": executed_result.get("error")})
+                response_parts.append(
+                    {
+                        "functionResponse": {
+                            "name": tool_name,
+                            "response": executed_result,
+                        }
+                    }
+                )
+            contents.append({"role": "user", "parts": response_parts})
+        raise HTTPException(status_code=502, detail="Agent exceeded the maximum number of web tool iterations")
+
     raise HTTPException(status_code=400, detail="Unsupported provider platform")
 
 
@@ -998,6 +1707,13 @@ def execute_task_run(
     task_run.finished_at = None
     task_run.error_message = None
     task_run.attempt_count += 1
+    task_run.input_payload = {}
+    _append_activity_event(
+        task_run,
+        stage="start",
+        message="Task run started",
+        details={"attempt_count": task_run.attempt_count},
+    )
     db.commit()
     db.refresh(task_run)
 
@@ -1027,14 +1743,51 @@ def execute_task_run(
                 "files": input_files,
                 "auto_retry_attempt": retry_index + 1,
                 "auto_retry_max_attempts": max_attempts,
+                "activity_log": (
+                    task_run.input_payload.get("activity_log", [])
+                    if isinstance(task_run.input_payload, dict)
+                    else []
+                ),
             }
+            _append_activity_event(
+                task_run,
+                stage="prepare",
+                message=f"Prepared attempt {retry_index + 1} of {max_attempts}",
+                details={
+                    "attempt": retry_index + 1,
+                    "max_attempts": max_attempts,
+                    "input_file_count": len(input_files),
+                },
+            )
             db.commit()
-            raw_text, raw_payload, tool_results = _execute_agent_roundtrip(agent, user_prompt)
+            raw_text, raw_payload, tool_results = _execute_agent_roundtrip_with_activity(
+                db,
+                task_run,
+                agent,
+                user_prompt,
+            )
             text, artifacts = _apply_file_operations(task_run, raw_text)
+            _append_activity_event(
+                task_run,
+                stage="result",
+                message="Validated final response",
+                details={
+                    "artifact_count": len(artifacts),
+                    "text_preview": text[:160],
+                },
+            )
+            db.commit()
             incomplete_reason = _detect_incomplete_task_result(task_run, text, artifacts)
             if incomplete_reason is None:
                 break
             last_error_message = incomplete_reason
+            _append_activity_event(
+                task_run,
+                stage="retry",
+                message="Result was incomplete, retrying task",
+                details={"reason": incomplete_reason},
+            )
+            db.commit()
             if retry_index == max_attempts - 1:
                 raise HTTPException(status_code=502, detail=incomplete_reason)
         except urllib_error.HTTPError as exc:
@@ -1058,6 +1811,13 @@ def execute_task_run(
         except HTTPException as exc:
             last_error_message = str(exc.detail)
             if retry_index < max_attempts - 1 and exc.status_code == 502:
+                _append_activity_event(
+                    task_run,
+                    stage="retry",
+                    message="Attempt failed, scheduling automatic retry",
+                    details={"reason": str(exc.detail), "next_attempt": retry_index + 2},
+                )
+                db.commit()
                 continue
             task_run.status = "failed"
             task_run.error_message = str(exc.detail)
@@ -1065,6 +1825,12 @@ def execute_task_run(
             workflow_run.status = "failed"
             workflow_run.error_message = task_run.error_message
             workflow_run.finished_at = task_run.finished_at
+            _append_activity_event(
+                task_run,
+                stage="failed",
+                message="Task run failed",
+                details={"reason": str(exc.detail)},
+            )
             db.commit()
             raise
         except ValueError as exc:
@@ -1078,16 +1844,27 @@ def execute_task_run(
             raise HTTPException(status_code=502, detail=task_run.error_message) from exc
 
     task_run.status = "completed"
+    task_run.error_message = None
+    task_run.finished_at = _utcnow()
+    _append_activity_event(
+        task_run,
+        stage="completed",
+        message="Task run completed",
+        details={"artifact_count": len(artifacts)},
+    )
     task_run.output_payload = {
         "text": text,
         "model": agent.provider_model.model_name,
         "provider": agent.provider_model.provider.platform,
         "artifacts": artifacts,
         "tool_results": tool_results,
+        "activity_log": (
+            task_run.input_payload.get("activity_log", [])
+            if isinstance(task_run.input_payload, dict)
+            else []
+        ),
         "raw_response": raw_payload,
     }
-    task_run.error_message = None
-    task_run.finished_at = _utcnow()
     _promote_ready_task_runs(db, workflow_run_id)
     _finalize_workflow_run_if_complete(workflow_run)
     db.commit()

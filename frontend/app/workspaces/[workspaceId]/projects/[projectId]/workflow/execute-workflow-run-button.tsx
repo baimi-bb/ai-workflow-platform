@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 type ExecuteWorkflowRunButtonProps = {
   workspaceId: number;
@@ -85,10 +85,24 @@ export function ExecuteWorkflowRunButton({
   const [pending, setPending] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (!pending) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      router.refresh();
+    }, 1000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [pending, router]);
+
   const handleExecute = async () => {
     setPending(true);
     setErrorMessage(null);
-    let activeTaskId: number | null = null;
+    let activeTaskIds: number[] = [];
 
     try {
       for (let attempt = 0; attempt < 120; attempt += 1) {
@@ -97,29 +111,33 @@ export function ExecuteWorkflowRunButton({
           projectId,
           workflowRunId,
         );
-        const nextReadyTaskRun = runBefore.task_runs.find(
+        const readyTaskRuns = runBefore.task_runs.filter(
           (taskRun) => taskRun.status === "ready",
         );
-        if (nextReadyTaskRun) {
-          activeTaskId = nextReadyTaskRun.task_id;
-          window.dispatchEvent(
-            new CustomEvent("workflow-task-run-start", {
-              detail: { taskId: nextReadyTaskRun.task_id },
-            }),
-          );
+        if (readyTaskRuns.length > 0) {
+          activeTaskIds = readyTaskRuns.map((taskRun) => taskRun.task_id);
+          for (const taskRun of readyTaskRuns) {
+            window.dispatchEvent(
+              new CustomEvent("workflow-task-run-start", {
+                detail: { taskId: taskRun.task_id },
+              }),
+            );
+          }
         }
         const run = await executeWorkflowRunRequest(
           workspaceId,
           projectId,
           workflowRunId,
         );
-        if (nextReadyTaskRun) {
-          window.dispatchEvent(
-            new CustomEvent("workflow-task-run-end", {
-              detail: { taskId: nextReadyTaskRun.task_id },
-            }),
-          );
-          activeTaskId = null;
+        if (readyTaskRuns.length > 0) {
+          for (const taskRun of readyTaskRuns) {
+            window.dispatchEvent(
+              new CustomEvent("workflow-task-run-end", {
+                detail: { taskId: taskRun.task_id },
+              }),
+            );
+          }
+          activeTaskIds = [];
         }
         router.refresh();
 
@@ -134,10 +152,10 @@ export function ExecuteWorkflowRunButton({
         error instanceof Error ? error.message : "执行 Workflow 失败",
       );
     } finally {
-      if (activeTaskId) {
+      for (const taskId of activeTaskIds) {
         window.dispatchEvent(
           new CustomEvent("workflow-task-run-end", {
-            detail: { taskId: activeTaskId },
+            detail: { taskId },
           }),
         );
       }

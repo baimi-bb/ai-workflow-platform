@@ -1,9 +1,11 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, UTC
 
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from app.db.session import SessionLocal
 from app.models.agent import Agent
 from app.models.project import Project
 from app.models.task import Task
@@ -110,6 +112,42 @@ def _fail_task_run_without_agent(db: Session, workflow_run: WorkflowRun, task_ru
     workflow_run.error_message = task_run.error_message
     workflow_run.finished_at = now
     db.commit()
+
+
+def _select_parallel_ready_task_runs(task_runs: list[TaskRun]) -> list[TaskRun]:
+    selected: list[TaskRun] = []
+    claimed_agent_ids: set[int] = set()
+
+    for task_run in task_runs:
+        agent_id = task_run.assigned_agent_id
+        if agent_id is None:
+            selected.append(task_run)
+            continue
+        if agent_id in claimed_agent_ids:
+            continue
+        claimed_agent_ids.add(agent_id)
+        selected.append(task_run)
+
+    return selected
+
+
+def _execute_task_run_in_worker(
+    workspace_id: int,
+    project_id: int,
+    workflow_run_id: int,
+    task_run_id: int,
+) -> None:
+    db = SessionLocal()
+    try:
+        agent_execution_service.execute_task_run(
+            db,
+            workspace_id,
+            project_id,
+            workflow_run_id,
+            task_run_id,
+        )
+    finally:
+        db.close()
 
 
 def _sync_workflow_run_state(db: Session, workflow_run: WorkflowRun) -> WorkflowRun:
@@ -241,33 +279,47 @@ def execute_workflow_run(
     if not ready_task_runs:
         return workflow_run
 
-    busy_waiting = False
-    for task_run in ready_task_runs:
+    selected_task_runs = _select_parallel_ready_task_runs(ready_task_runs)
+    for task_run in selected_task_runs:
         if task_run.assigned_agent_id is None:
             if task_run.node_type in {"start", "end"}:
                 return _sync_workflow_run_state(db, workflow_run)
             _fail_task_run_without_agent(db, workflow_run, task_run)
             return _load_workflow_run_for_execution_or_404(db, project_id, workflow_run_id)
 
-        try:
-            agent_execution_service.execute_task_run(
-                db,
+    busy_waiting = False
+    launched_task_ids: list[int] = []
+    max_workers = max(1, len(selected_task_runs))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(
+                _execute_task_run_in_worker,
                 workspace_id,
                 project_id,
                 workflow_run_id,
                 task_run.id,
-            )
-            workflow_run = _load_workflow_run_for_execution_or_404(
-                db,
-                project_id,
-                workflow_run_id,
-            )
-            return _sync_workflow_run_state(db, workflow_run)
-        except HTTPException as exc:
-            if exc.status_code == 409:
-                busy_waiting = True
-                continue
-            raise
+            ): task_run
+            for task_run in selected_task_runs
+            if task_run.assigned_agent_id is not None
+        }
+        for future in as_completed(future_map):
+            task_run = future_map[future]
+            try:
+                future.result()
+                launched_task_ids.append(task_run.id)
+            except HTTPException as exc:
+                if exc.status_code == 409:
+                    busy_waiting = True
+                    continue
+                raise
+
+    if launched_task_ids:
+        workflow_run = _load_workflow_run_for_execution_or_404(
+            db,
+            project_id,
+            workflow_run_id,
+        )
+        return _sync_workflow_run_state(db, workflow_run)
 
     if busy_waiting:
         workflow_run.status = "queued"
