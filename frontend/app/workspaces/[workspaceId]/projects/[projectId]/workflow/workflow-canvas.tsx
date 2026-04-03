@@ -31,7 +31,7 @@ type DragState = {
 
 type PanState = {
   initialPointer: Point;
-  initialPan: Point;
+  initialScroll: Point;
 };
 
 type MarqueeState = {
@@ -42,7 +42,8 @@ type MarqueeState = {
 const NODE_WIDTH = 340;
 const NODE_HEIGHT = 300;
 const MIN_GAP = 220;
-const VIEWPORT_MIN_HEIGHT = 960;
+const CANVAS_PADDING = 160;
+const VIEWPORT_HEIGHT = "clamp(560px, 78vh, 960px)";
 
 function getRuntimeStatus(task: Task, taskRun: TaskRun | null, workflowRunStatus: string | null) {
   if (!taskRun) {
@@ -129,6 +130,53 @@ function intersectsNode(box: MarqueeState, task: Task) {
   );
 }
 
+function getLatestActivityMessage(taskRun: TaskRun | null): string | null {
+  if (!taskRun) {
+    return null;
+  }
+
+  const payloads = [taskRun.input_payload, taskRun.output_payload];
+  const entries: Array<{ timestamp: string; message: string }> = [];
+  for (const payload of payloads) {
+    const activityLog = payload?.activity_log;
+    if (!Array.isArray(activityLog)) {
+      continue;
+    }
+    for (const entry of activityLog) {
+      if (typeof entry !== "object" || entry === null) {
+        continue;
+      }
+      const timestamp = "timestamp" in entry ? String(entry.timestamp) : "";
+      const message = "message" in entry ? String(entry.message) : "";
+      if (!timestamp || !message) {
+        continue;
+      }
+      entries.push({ timestamp, message });
+    }
+  }
+
+  if (entries.length === 0) {
+    return null;
+  }
+
+  entries.sort((left, right) => left.timestamp.localeCompare(right.timestamp));
+  return entries[entries.length - 1]?.message ?? null;
+}
+
+function shouldIgnoreSpaceShortcut(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+
+  const tagName = target.tagName.toLowerCase();
+  return (
+    target.isContentEditable ||
+    tagName === "input" ||
+    tagName === "textarea" ||
+    tagName === "select"
+  );
+}
+
 export function WorkflowCanvas({
   workspaceId,
   projectId,
@@ -151,7 +199,6 @@ export function WorkflowCanvas({
   const [savingTaskIds, setSavingTaskIds] = useState<number[]>([]);
   const [editingTaskId, setEditingTaskId] = useState<number | null>(null);
   const [zoom, setZoom] = useState(1);
-  const [pan, setPan] = useState<Point>({ x: 0, y: 0 });
   const [spacePressed, setSpacePressed] = useState(false);
 
   useEffect(() => {
@@ -201,22 +248,30 @@ export function WorkflowCanvas({
   const enabledAgents = useMemo(() => agents.filter((agent) => agent.is_enabled), [agents]);
   const canvasWidth = useMemo(() => {
     const maxX = Math.max(...nodes.map((task) => task.canvas_x + NODE_WIDTH), NODE_WIDTH);
-    return maxX + MIN_GAP;
+    return maxX + MIN_GAP + CANVAS_PADDING;
   }, [nodes]);
   const canvasHeight = useMemo(() => {
     const maxY = Math.max(...nodes.map((task) => task.canvas_y + NODE_HEIGHT), NODE_HEIGHT);
-    return maxY + MIN_GAP;
+    return maxY + MIN_GAP + CANVAS_PADDING;
   }, [nodes]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.code === "Space") {
+        if (shouldIgnoreSpaceShortcut(event.target)) {
+          return;
+        }
+        event.preventDefault();
         setSpacePressed(true);
       }
     };
 
     const onKeyUp = (event: KeyboardEvent) => {
       if (event.code === "Space") {
+        if (shouldIgnoreSpaceShortcut(event.target)) {
+          return;
+        }
+        event.preventDefault();
         setSpacePressed(false);
       }
     };
@@ -238,10 +293,10 @@ export function WorkflowCanvas({
 
     const bounds = viewport.getBoundingClientRect();
     return {
-      x: (clientX - bounds.left - pan.x) / zoom,
-      y: (clientY - bounds.top - pan.y) / zoom,
+      x: (clientX - bounds.left + viewport.scrollLeft) / zoom,
+      y: (clientY - bounds.top + viewport.scrollTop) / zoom,
     };
-  }, [pan.x, pan.y, zoom]);
+  }, [zoom]);
 
   useEffect(() => {
     if (!dragState && !panState && !marqueeState && !linkSourceId) {
@@ -270,10 +325,13 @@ export function WorkflowCanvas({
       }
 
       if (panState) {
-        setPan({
-          x: panState.initialPan.x + (event.clientX - panState.initialPointer.x),
-          y: panState.initialPan.y + (event.clientY - panState.initialPointer.y),
-        });
+        const viewport = viewportRef.current;
+        if (viewport) {
+          viewport.scrollLeft =
+            panState.initialScroll.x - (event.clientX - panState.initialPointer.x);
+          viewport.scrollTop =
+            panState.initialScroll.y - (event.clientY - panState.initialPointer.y);
+        }
       }
 
       if (marqueeState) {
@@ -362,7 +420,10 @@ export function WorkflowCanvas({
     if (spacePressed) {
       setPanState({
         initialPointer: { x: event.clientX, y: event.clientY },
-        initialPan: pan,
+        initialScroll: {
+          x: viewportRef.current?.scrollLeft ?? 0,
+          y: viewportRef.current?.scrollTop ?? 0,
+        },
       });
       return;
     }
@@ -501,10 +562,40 @@ export function WorkflowCanvas({
   };
 
   const handleWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+    if (!spacePressed) {
+      return;
+    }
+
     event.preventDefault();
     event.stopPropagation();
+    const viewport = viewportRef.current;
+    if (!viewport) {
+      return;
+    }
+
+    const bounds = viewport.getBoundingClientRect();
+    const pointerOffsetX = event.clientX - bounds.left;
+    const pointerOffsetY = event.clientY - bounds.top;
+    const canvasPointX = (viewport.scrollLeft + pointerOffsetX) / zoom;
+    const canvasPointY = (viewport.scrollTop + pointerOffsetY) / zoom;
     const delta = event.deltaY < 0 ? 0.1 : -0.1;
-    setZoom((current) => Math.min(2, Math.max(0.5, Number((current + delta).toFixed(2)))));
+    const nextZoom = Math.min(2, Math.max(0.5, Number((zoom + delta).toFixed(2))));
+
+    if (nextZoom === zoom) {
+      return;
+    }
+
+    setZoom(nextZoom);
+
+    requestAnimationFrame(() => {
+      const nextViewport = viewportRef.current;
+      if (!nextViewport) {
+        return;
+      }
+
+      nextViewport.scrollLeft = Math.max(0, canvasPointX * nextZoom - pointerOffsetX);
+      nextViewport.scrollTop = Math.max(0, canvasPointY * nextZoom - pointerOffsetY);
+    });
   };
 
   return (
@@ -514,7 +605,7 @@ export function WorkflowCanvas({
           <div className="flex flex-wrap gap-3 text-sm text-slate-600">
             <span className="rounded-full bg-white px-4 py-2">框选支持多选节点</span>
             <span className="rounded-full bg-white px-4 py-2">按住空格可拖动画布</span>
-            <span className="rounded-full bg-white px-4 py-2">鼠标在画布内可直接滚轮缩放</span>
+            <span className="rounded-full bg-white px-4 py-2">按住空格再滚轮可缩放画布</span>
             <span className="rounded-full bg-white px-4 py-2">右键连线可直接删除</span>
             {selectedRun ? (
               <span className="rounded-full bg-emerald-100 px-4 py-2 text-emerald-800">
@@ -570,12 +661,13 @@ export function WorkflowCanvas({
 
         <div
           ref={viewportRef}
+          onWheelCapture={handleWheel}
           onWheel={handleWheel}
           onPointerDown={handleViewportPointerDown}
-          className={`overflow-auto overscroll-none rounded-[24px] border border-slate-200 bg-white/60 p-4 ${
+          className={`overflow-scroll overscroll-none rounded-[24px] border border-slate-200 bg-white/60 p-4 ${
             spacePressed ? "cursor-grab" : "cursor-default"
           }`}
-          style={{ minHeight: `${VIEWPORT_MIN_HEIGHT}px` }}
+          style={{ height: VIEWPORT_HEIGHT }}
         >
           <div
             className="relative"
@@ -589,7 +681,7 @@ export function WorkflowCanvas({
               style={{
                 width: `${canvasWidth}px`,
                 height: `${canvasHeight}px`,
-                transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+                transform: `scale(${zoom})`,
               }}
             >
               <svg
@@ -711,6 +803,7 @@ export function WorkflowCanvas({
                   typeof taskRun.output_payload.text === "string"
                     ? taskRun.output_payload.text
                     : null;
+                const latestActivityMessage = getLatestActivityMessage(taskRun);
 
                 return (
                   <article
@@ -805,6 +898,17 @@ export function WorkflowCanvas({
                       <p className="mt-4 rounded-2xl bg-rose-100 px-3 py-2 text-xs leading-6 text-rose-700">
                         {taskRun.error_message}
                       </p>
+                    ) : null}
+
+                    {latestActivityMessage ? (
+                      <div className="mt-4 rounded-2xl border border-sky-100 bg-sky-50/80 px-3 py-2">
+                        <p className="text-[11px] uppercase tracking-[0.18em] text-sky-500">
+                          Activity
+                        </p>
+                        <p className="mt-1 line-clamp-3 text-xs leading-6 text-sky-900">
+                          {latestActivityMessage}
+                        </p>
+                      </div>
                     ) : null}
 
                     {outputText ? (

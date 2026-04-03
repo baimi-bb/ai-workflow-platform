@@ -232,14 +232,14 @@ class WorkflowRunServiceTests(unittest.TestCase):
         self.assertEqual([task_run.id for task_run in ordered], [103, 102, 101, 100])
 
     @patch("app.services.workflow_run_service.get_project_for_workspace_or_404")
-    @patch("app.services.workflow_run_service.agent_execution_service.execute_task_run")
+    @patch("app.services.workflow_run_service._execute_task_run_in_worker")
     @patch("app.services.workflow_run_service._sync_workflow_run_state")
     @patch("app.services.workflow_run_service._load_workflow_run_for_execution_or_404")
     def test_execute_workflow_run_marks_run_queued_when_all_ready_agents_busy(
         self,
         mock_load_workflow_run,
         mock_sync_state,
-        mock_execute_task_run,
+        mock_execute_task_run_in_worker,
         mock_get_project,
     ) -> None:
         db = MagicMock()
@@ -278,7 +278,7 @@ class WorkflowRunServiceTests(unittest.TestCase):
 
         mock_load_workflow_run.side_effect = [workflow_run, workflow_run, workflow_run]
         mock_sync_state.return_value = workflow_run
-        mock_execute_task_run.side_effect = HTTPException(
+        mock_execute_task_run_in_worker.side_effect = HTTPException(
             status_code=409,
             detail="Assigned agent is busy",
         )
@@ -289,20 +289,8 @@ class WorkflowRunServiceTests(unittest.TestCase):
         self.assertEqual(workflow_run.status, "queued")
         db.commit.assert_called()
 
-    @patch("app.services.workflow_run_service.get_project_for_workspace_or_404")
-    @patch("app.services.workflow_run_service.agent_execution_service.execute_task_run")
-    @patch("app.services.workflow_run_service._sync_workflow_run_state")
-    @patch("app.services.workflow_run_service._load_workflow_run_for_execution_or_404")
-    def test_execute_workflow_run_advances_only_one_ready_task_run_per_call(
-        self,
-        mock_load_workflow_run,
-        mock_sync_state,
-        mock_execute_task_run,
-        mock_get_project,
-    ) -> None:
+    def test_select_parallel_ready_task_runs_keeps_one_task_per_agent(self) -> None:
         db = MagicMock()
-        workflow_run_before = WorkflowRun(project_id=2, status="running", trigger_type="manual")
-        workflow_run_before.id = 20
 
         high_task = Task(
             project_id=2,
@@ -359,21 +347,42 @@ class WorkflowRunServiceTests(unittest.TestCase):
         )
         low_task_run.id = 41
         low_task_run.task = low_task
-        low_task_run.created_at = datetime(2026, 3, 31, 9, 1, 0)
-        low_task_run.updated_at = datetime(2026, 3, 31, 9, 1, 0)
-        workflow_run_before.task_runs = [high_task_run, low_task_run]
 
-        workflow_run_after = WorkflowRun(project_id=2, status="running", trigger_type="manual")
-        workflow_run_after.id = 20
-        workflow_run_after.task_runs = [low_task_run]
+        selected = workflow_run_service._select_parallel_ready_task_runs([high_task_run, low_task_run])
 
-        mock_load_workflow_run.side_effect = [workflow_run_before, workflow_run_after]
-        mock_sync_state.side_effect = [workflow_run_before, workflow_run_after]
+        self.assertEqual([task_run.id for task_run in selected], [40, 41])
 
-        result = workflow_run_service.execute_workflow_run(db, 1, 2, 20)
+        shared_task = Task(
+            project_id=2,
+            title="Shared agent task",
+            description=None,
+            node_type="task",
+            status="todo",
+            priority="low",
+            display_order=3,
+            task_dependencies=[],
+        )
+        shared_task.id = 4
+        shared_task_run = TaskRun(
+            workflow_run_id=20,
+            task_id=4,
+            assigned_agent_id=11,
+            assigned_agent_name="Agent 1",
+            title_snapshot="Shared agent task",
+            node_type="task",
+            status="ready",
+            executor_type="system",
+            task_dependencies_snapshot=[],
+            attempt_count=0,
+        )
+        shared_task_run.id = 42
+        shared_task_run.task = shared_task
 
-        self.assertIs(result, workflow_run_after)
-        mock_execute_task_run.assert_called_once_with(db, 1, 2, 20, 40)
+        selected_with_conflict = workflow_run_service._select_parallel_ready_task_runs(
+            [high_task_run, shared_task_run, low_task_run]
+        )
+
+        self.assertEqual([task_run.id for task_run in selected_with_conflict], [40, 41])
 
 
     def test_get_workflow_run_for_project_or_404_rejects_wrong_project(self) -> None:

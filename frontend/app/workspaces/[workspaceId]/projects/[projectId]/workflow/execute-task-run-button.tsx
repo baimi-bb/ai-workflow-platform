@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 type ExecuteTaskRunButtonProps = {
   workspaceId: number;
@@ -56,6 +56,20 @@ export function ExecuteTaskRunButton({
   const router = useRouter();
   const [pending, setPending] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!pending) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      router.refresh();
+    }, 1000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [pending, router]);
 
   const handleExecute = async () => {
     setPending(true);

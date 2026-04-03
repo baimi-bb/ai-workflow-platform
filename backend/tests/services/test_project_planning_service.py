@@ -94,6 +94,7 @@ class ProjectPlanningServiceTests(unittest.TestCase):
         project.id = 21
         project.workspace = MagicMock()
         project.workspace.agents = [planner_agent, build_agent, review_agent]
+        project.workspace.root_path = None
         project.tasks = []
         return project, planner_agent, [planner_agent, build_agent, review_agent]
 
@@ -149,16 +150,23 @@ class ProjectPlanningServiceTests(unittest.TestCase):
                 {
                     "title": "Design API",
                     "description": "Define the new planning endpoint",
+                    "objective": "Create the project planning API contract",
+                    "deliverable": "A concrete API design task description",
                     "priority": "high",
                     "assigned_agent_id": 12,
                     "depends_on_titles": [],
+                    "required_workspace_paths": ["project-docs/api-spec.md"],
+                    "suggested_output_paths": ["project-docs/generated-plan.md"],
                 },
                 {
                     "title": "Review flow",
                     "description": "Check the generated workflow",
+                    "objective": "Validate dependencies and runtime flow",
+                    "deliverable": "A reviewed workflow plan",
                     "priority": "medium",
                     "assigned_agent_name": "Review Agent",
                     "depends_on_titles": ["Design API"],
+                    "input_from_titles": ["Design API"],
                 },
             ],
         }
@@ -295,7 +303,7 @@ class ProjectPlanningServiceTests(unittest.TestCase):
             status="todo",
             priority="medium",
             display_order=2,
-            canvas_x=1020,
+            canvas_x=1100,
             canvas_y=120,
             task_dependencies=[101],
         )
@@ -310,7 +318,7 @@ class ProjectPlanningServiceTests(unittest.TestCase):
             status="todo",
             priority="low",
             display_order=99,
-            canvas_x=1540,
+            canvas_x=1700,
             canvas_y=120,
             task_dependencies=[102],
         )
@@ -350,12 +358,73 @@ class ProjectPlanningServiceTests(unittest.TestCase):
         self.assertEqual(result["created_tasks"][1]["id"], 102)
         self.assertEqual(mock_create_task.call_count, 2)
         self.assertEqual(mock_update_task.call_count, 7)
+        self.assertIn("Execution Standard:", mock_create_task.call_args_list[0].args[3].description)
+        self.assertIn("Required workspace files: project-docs/api-spec.md", mock_create_task.call_args_list[0].args[3].description)
+        self.assertIn("Suggested output files: project-docs/generated-plan.md", mock_create_task.call_args_list[0].args[3].description)
+        self.assertIn("Required upstream task outputs: Design API", mock_create_task.call_args_list[1].args[3].description)
         self.assertEqual(mock_update_task.call_args_list[4].args[4].canvas_x, 500)
         self.assertEqual(mock_update_task.call_args_list[4].args[4].canvas_y, 120)
-        self.assertEqual(mock_update_task.call_args_list[5].args[4].canvas_x, 1020)
-        self.assertEqual(mock_update_task.call_args_list[5].args[4].canvas_y, 120)
-        self.assertEqual(mock_update_task.call_args_list[6].args[4].canvas_x, 1540)
-        self.assertEqual(mock_update_task.call_args_list[6].args[4].canvas_y, 120)
+        self.assertEqual(mock_update_task.call_args_list[5].args[4].canvas_x, 1100)
+        self.assertEqual(mock_update_task.call_args_list[5].args[4].canvas_y, 510)
+        self.assertEqual(mock_update_task.call_args_list[6].args[4].canvas_x, 1700)
+        self.assertEqual(mock_update_task.call_args_list[6].args[4].canvas_y, 510)
+
+    def test_parse_plan_payload_merges_input_titles_into_dependencies(self) -> None:
+        _project, _planner_agent, agents = self._build_project_and_agents()
+
+        summary, tasks = project_planning_service._parse_plan_payload(
+            {
+                "summary": "structured",
+                "tasks": [
+                    {
+                        "title": "Collect source data",
+                        "description": "Collect data from workspace files",
+                        "objective": "Prepare the raw dataset",
+                        "deliverable": "A normalized csv file",
+                        "required_workspace_paths": ["data/template.csv"],
+                        "suggested_output_paths": ["data/normalized.csv"],
+                    },
+                    {
+                        "title": "Analyze trend",
+                        "description": "Analyze the prepared data",
+                        "objective": "Generate the trend analysis",
+                        "deliverable": "A markdown report",
+                        "depends_on_titles": ["Collect source data"],
+                        "input_from_titles": ["Collect source data"],
+                        "required_workspace_paths": ["reports/notes.md"],
+                        "suggested_output_paths": ["reports/ne-trend.md"],
+                    },
+                ],
+            },
+            agents,
+        )
+
+        self.assertEqual(summary, "structured")
+        self.assertEqual(tasks[1]["depends_on_titles"], ["Collect source data"])
+        self.assertEqual(tasks[1]["input_from_titles"], ["Collect source data"])
+        self.assertIn("Execution Standard:", tasks[0]["description"])
+        self.assertIn("Required workspace files: data/template.csv", tasks[0]["description"])
+        self.assertIn("Suggested output files: data/normalized.csv", tasks[0]["description"])
+        self.assertIn("Deliverable: A markdown report", tasks[1]["description"])
+
+    def test_build_project_plan_prompt_includes_workspace_files_context(self) -> None:
+        project, _planner_agent, agents = self._build_project_and_agents()
+
+        with patch(
+            "app.services.project_planning_service._collect_workspace_file_context",
+            return_value=["data/template.csv", "reports/outline.md"],
+        ):
+            prompt = project_planning_service._build_project_plan_prompt(
+                project,
+                ProjectPlanCreate(planner_agent_id=11),
+                agents,
+            )
+
+        self.assertIn("Workspace files you can plan around:", prompt)
+        self.assertIn("- data/template.csv", prompt)
+        self.assertIn('"input_from_titles"', prompt)
+        self.assertIn('"required_workspace_paths"', prompt)
+        self.assertIn('"suggested_output_paths"', prompt)
 
     def test_parse_plan_payload_rejects_duplicate_titles(self) -> None:
         _project, _planner_agent, agents = self._build_project_and_agents()
@@ -478,7 +547,7 @@ class ProjectPlanningServiceTests(unittest.TestCase):
         self.assertEqual(row_map[11], 1)
         self.assertEqual(row_map[12], 0)
         self.assertEqual(row_map[13], 1)
-        self.assertEqual(row_map[14], 0)
+        self.assertEqual(row_map[14], 1)
 
     def test_parse_plan_payload_rejects_unknown_dependency(self) -> None:
         _project, _planner_agent, agents = self._build_project_and_agents()
@@ -499,6 +568,79 @@ class ProjectPlanningServiceTests(unittest.TestCase):
 
         self.assertEqual(context.exception.status_code, 400)
         self.assertIn("unknown dependency title", context.exception.detail)
+
+    def test_build_layout_row_map_zigzags_single_path_instead_of_single_line(self) -> None:
+        start_task = Task(
+            project_id=21,
+            agent_id=None,
+            title="Start",
+            description=None,
+            node_type="start",
+            status="done",
+            priority="low",
+            display_order=0,
+            canvas_x=40,
+            canvas_y=120,
+            task_dependencies=[],
+        )
+        start_task.id = 1
+
+        task_a = Task(
+            project_id=21,
+            agent_id=None,
+            title="Task A",
+            description=None,
+            node_type="task",
+            status="todo",
+            priority="medium",
+            display_order=1,
+            canvas_x=0,
+            canvas_y=0,
+            task_dependencies=[1],
+        )
+        task_a.id = 10
+
+        task_b = Task(
+            project_id=21,
+            agent_id=None,
+            title="Task B",
+            description=None,
+            node_type="task",
+            status="todo",
+            priority="medium",
+            display_order=2,
+            canvas_x=0,
+            canvas_y=0,
+            task_dependencies=[10],
+        )
+        task_b.id = 11
+
+        task_c = Task(
+            project_id=21,
+            agent_id=None,
+            title="Task C",
+            description=None,
+            node_type="task",
+            status="todo",
+            priority="medium",
+            display_order=3,
+            canvas_x=0,
+            canvas_y=0,
+            task_dependencies=[11],
+        )
+        task_c.id = 12
+
+        project_tasks = [start_task, task_a, task_b, task_c]
+        depth_map = project_planning_service._build_depth_map(project_tasks)
+        row_map = project_planning_service._build_layout_row_map(
+            project_tasks,
+            {10, 11, 12},
+            depth_map,
+        )
+
+        self.assertEqual(row_map[10], 0)
+        self.assertEqual(row_map[11], 1)
+        self.assertEqual(row_map[12], 0)
 
     @patch("app.services.project_planning_service.agent_execution_service._extract_json_object_from_text")
     @patch("app.services.project_planning_service.agent_execution_service._call_provider")

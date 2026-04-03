@@ -109,7 +109,7 @@ class AgentExecutionServiceTests(unittest.TestCase):
 
     @patch("app.services.agent_execution_service.get_project_for_workspace_or_404")
     @patch("app.services.agent_execution_service._load_task_run_or_404")
-    @patch("app.services.agent_execution_service._execute_agent_roundtrip")
+    @patch("app.services.agent_execution_service._execute_agent_roundtrip_with_activity")
     @patch("app.services.agent_execution_service._promote_ready_task_runs")
     @patch("app.services.agent_execution_service._finalize_workflow_run_if_complete")
     def test_execute_task_run_completes_successfully(
@@ -137,9 +137,12 @@ class AgentExecutionServiceTests(unittest.TestCase):
                 "files": [],
                 "auto_retry_attempt": 1,
                 "auto_retry_max_attempts": agent_execution_service.settings.agent_task_auto_retry_attempts,
+                "activity_log": task_run.input_payload["activity_log"],
             },
         )
+        self.assertGreaterEqual(len(task_run.input_payload["activity_log"]), 3)
         self.assertEqual(task_run.output_payload["text"], "Final answer")
+        self.assertGreaterEqual(len(task_run.output_payload["activity_log"]), 1)
         self.assertEqual(task_run.attempt_count, 1)
         mock_promote.assert_called_once_with(db, 30)
         mock_finalize.assert_called_once_with(workflow_run)
@@ -168,7 +171,7 @@ class AgentExecutionServiceTests(unittest.TestCase):
 
     @patch("app.services.agent_execution_service.get_project_for_workspace_or_404")
     @patch("app.services.agent_execution_service._load_task_run_or_404")
-    @patch("app.services.agent_execution_service._execute_agent_roundtrip")
+    @patch("app.services.agent_execution_service._execute_agent_roundtrip_with_activity")
     @patch("app.services.agent_execution_service._promote_ready_task_runs")
     @patch("app.services.agent_execution_service._finalize_workflow_run_if_complete")
     def test_execute_task_run_allows_retry_from_failed_status(
@@ -199,7 +202,7 @@ class AgentExecutionServiceTests(unittest.TestCase):
 
     @patch("app.services.agent_execution_service.get_project_for_workspace_or_404")
     @patch("app.services.agent_execution_service._load_task_run_or_404")
-    @patch("app.services.agent_execution_service._execute_agent_roundtrip")
+    @patch("app.services.agent_execution_service._execute_agent_roundtrip_with_activity")
     @patch("app.services.agent_execution_service._promote_ready_task_runs")
     @patch("app.services.agent_execution_service._finalize_workflow_run_if_complete")
     def test_execute_task_run_retries_incomplete_result_before_completing(
@@ -466,9 +469,34 @@ class AgentExecutionServiceTests(unittest.TestCase):
         self.assertEqual(context.exception.status_code, 502)
         self.assertIn("tool_calls", str(context.exception.detail))
 
+    def test_validate_final_response_payload_accepts_summary_without_files(self) -> None:
+        payload = agent_execution_service._validate_final_response_payload(
+            json.dumps(
+                {
+                    "summary": "Checked the weather and prepared the answer.",
+                }
+            )
+        )
+
+        self.assertEqual(
+            payload,
+            {"summary": "Checked the weather and prepared the answer."},
+        )
+
+    def test_detect_incomplete_task_result_does_not_require_artifacts(self) -> None:
+        task_run, _ = self._build_ready_task_run()
+
+        incomplete_reason = agent_execution_service._detect_incomplete_task_result(
+            task_run,
+            "已完成天气查询并整理结果。",
+            [],
+        )
+
+        self.assertIsNone(incomplete_reason)
+
     @patch("app.services.agent_execution_service.get_project_for_workspace_or_404")
     @patch("app.services.agent_execution_service._load_task_run_or_404")
-    @patch("app.services.agent_execution_service._execute_agent_roundtrip")
+    @patch("app.services.agent_execution_service._execute_agent_roundtrip_with_activity")
     def test_execute_task_run_fails_when_agent_returns_single_tool_request_object(
         self,
         mock_execute_roundtrip,
@@ -649,6 +677,14 @@ class AgentExecutionServiceTests(unittest.TestCase):
             [{"path": "docs/notes.txt", "source": "referenced"}],
         )
 
+    def test_build_user_prompt_uses_native_tool_guidance_for_tool_models(self) -> None:
+        task_run, _ = self._build_ready_task_run()
+
+        prompt, _input_files = agent_execution_service._build_user_prompt(task_run)
+
+        self.assertIn("call the provided web tools directly", prompt)
+        self.assertNotIn("Tool request JSON format", prompt)
+
     def test_collect_input_files_includes_dependency_artifacts(self) -> None:
         task_run, workflow_run = self._build_ready_task_run()
         task_run.task_dependencies_snapshot = [41]
@@ -694,3 +730,81 @@ class AgentExecutionServiceTests(unittest.TestCase):
             agent_execution_service._collect_input_files(task_run),
             [{"path": "outputs/draft.md", "source": "dependency_task_run:49"}],
         )
+
+    @patch("app.services.agent_execution_service._execute_tool_call")
+    @patch("app.services.agent_execution_service.urllib_request.urlopen")
+    def test_execute_agent_roundtrip_native_tools_for_openai_compatible(
+        self,
+        mock_urlopen,
+        mock_execute_tool_call,
+    ) -> None:
+        task_run, _ = self._build_ready_task_run()
+        agent = task_run.assigned_agent
+        response_with_tool_call = MagicMock()
+        response_with_tool_call.read.return_value = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "web_search",
+                                        "arguments": json.dumps(
+                                            {"query": "Rizhao weather today", "max_results": 3}
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        ).encode("utf-8")
+        response_with_final = MagicMock()
+        response_with_final.read.return_value = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "summary": "Sunny, 24C",
+                                    "files": [],
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+        ).encode("utf-8")
+        mock_urlopen.return_value.__enter__.side_effect = [
+            response_with_tool_call,
+            response_with_final,
+        ]
+        mock_execute_tool_call.return_value = {
+            "tool": "web_search",
+            "query": "Rizhao weather today",
+            "results": [{"title": "Weather", "url": "https://example.com/weather"}],
+        }
+
+        raw_text, raw_payload, tool_results = agent_execution_service._execute_agent_roundtrip_native_tools(
+            agent,
+            "Get today's weather in Rizhao.",
+        )
+
+        self.assertEqual(json.loads(raw_text), {"summary": "Sunny, 24C", "files": []})
+        self.assertEqual(raw_payload["choices"][0]["message"]["content"], json.dumps({"summary": "Sunny, 24C", "files": []}))
+        self.assertEqual(len(tool_results), 1)
+        self.assertTrue(tool_results[0]["ok"])
+        self.assertEqual(tool_results[0]["request"]["tool"], "web_search")
+        first_request = mock_urlopen.call_args_list[0].args[0]
+        second_request = mock_urlopen.call_args_list[1].args[0]
+        first_payload = json.loads(first_request.data.decode("utf-8"))
+        second_payload = json.loads(second_request.data.decode("utf-8"))
+        self.assertEqual(first_payload["tool_choice"], "auto")
+        self.assertIn("tools", first_payload)
+        self.assertEqual(second_payload["messages"][-1]["role"], "tool")
